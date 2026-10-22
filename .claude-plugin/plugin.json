@@ -1,0 +1,13 @@
+{
+  "name": "rook",
+  "version": "1.1.1003",
+  "description": "Hand web work, files and bash to Rook, the browser agent in your own Chrome profiles.",
+  "author": {
+    "name": "MCP-B",
+    "url": "https://github.com/WebMCP-org"
+  },
+  "homepage": "https://rook.sigvelo.com",
+  "repository": "https://github.com/WebMCP-org/rook-plugin",
+  "license": "Apache-2.0",
+  "keywords": ["agent-skills", "browser-agent", "chrome", "claude-code", "rook", "webmcp"]
+}

@@ -1,0 +1,63 @@
+{
+  "name": "@mcp-b/rook",
+  "version": "1.1.1003",
+  "description": "Hand web work, files and bash to Rook, the browser agent in your own Chrome profiles.",
+  "keywords": [
+    "agent-skills",
+    "browser-agent",
+    "chrome",
+    "claude-code",
+    "rook",
+    "webmcp"
+  ],
+  "homepage": "https://rook.sigvelo.com",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WebMCP-org/rook-plugin.git"
+  },
+  "bin": {
+    "rook": "./bin/rook"
+  },
+  "files": [
+    ".claude-plugin",
+    "agents",
+    "bin",
+    "skills"
+  ],
+  "type": "module",
+  "exports": {
+    "./wire/contracts": "./src/wire/contracts.ts",
+    "./wire/relay": "./src/wire/relay.ts",
+    "./wire/relay-actor": "./src/wire/relay-actor.ts",
+    "./wire/responses-socket": "./src/wire/responses-socket.ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepack": "vp run build",
+    "test": "vp exec vitest run",
+    "typecheck": "vp exec tsc -p tsconfig.json && vp exec tsc -p src/wire/tsconfig.json"
+  },
+  "devDependencies": {
+    "@ai-sdk/openai": "4.0.89",
+    "@cloudflare/codemode": "https://github.com/WebMCP-org/do-runtime/releases/download/rook-sdk-abba5d67d9d6/cloudflare-codemode-0.5.3.tgz",
+    "@openai-oauth/core": "2.0.0",
+    "@openai-oauth/local": "2.0.0",
+    "@types/node": "26.6.4",
+    "@types/ws": "8.18.2",
+    "agents": "https://github.com/WebMCP-org/do-runtime/releases/download/rook-sdk-abba5d67d9d6/agents-0.27.0.tgz",
+    "ai": "7.0.133",
+    "just-bash": "https://github.com/WebMCP-org/just-bash/releases/download/rook-native-mounts-2e70eea11e4e/just-bash-3.4.2.tgz",
+    "smol-toml": "1.9.0",
+    "typescript": "5.9.3",
+    "vite-plus": "0.3.1",
+    "vitest": "4.1.11",
+    "ws": "8.22.0",
+    "zod": "4.6.5"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

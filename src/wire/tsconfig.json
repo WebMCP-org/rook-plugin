@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    // The relay runs on Cloudflare too: web-platform globals only, no Node
+    // types, so a runtime API here fails to compile.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": []
+  },
+  "include": ["relay.ts", "relay-actor.ts", "responses-socket.ts"]
+}
