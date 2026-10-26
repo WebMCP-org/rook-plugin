@@ -3,11 +3,14 @@ name: Release
 # Rook's monorepo pushes each release here as a commit and its v<version> tag.
 # This workflow builds that tag, publishes it to npm by trusted publishing
 # (which adds npm provenance), attests the artifacts and cuts the GitHub
-# release. A rerun skips whatever already shipped.
+# release. A rerun skips whatever already shipped. A tag push that started no
+# run is released by dispatching this workflow on the tag:
+# gh workflow run release.yml -R WebMCP-org/rook-plugin --ref v<version>
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions: {}
 

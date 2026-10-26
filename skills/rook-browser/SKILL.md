@@ -6,7 +6,7 @@ allowed-tools: Bash(rook ls:*), Bash(rook ps:*), Bash(rook wait:*), Bash(rook sh
 
 # rook-browser
 
-Rook is an agent in the user's Chrome. Each Chrome profile with Rook is its own Rook, signed in as that profile's email, with its own threads and its own workspace filesystem. If `rook --version` doesn't print `rook 1.1.1003 (@mcp-b/rook)`, use `npx -y @mcp-b/rook@1.1.1003` in place of `rook`.
+Rook is an agent in the user's Chrome. Each Chrome profile with Rook is its own Rook, signed in as that profile's email, with its own threads and its own workspace filesystem. If `rook --version` doesn't print `rook 1.1.1005 (@mcp-b/rook)`, use `npx -y @mcp-b/rook@1.1.1005` in place of `rook`.
 
 ## The loop
 

@@ -44,6 +44,8 @@ gh attestation verify mcp-b-rook-<version>.tgz -R WebMCP-org/rook-plugin
 gh attestation verify rook -R WebMCP-org/rook-plugin
 ```
 
+A tag whose push started no release run is released with `gh workflow run release.yml -R WebMCP-org/rook-plugin --ref v<version>`.
+
 ## Contributing
 
 Issues are welcome here; report vulnerabilities as [SECURITY.md](SECURITY.md) says. This repository is a read-only mirror of the CLI's source, published from Rook's main repository on every Rook release, so pull requests aren't merged here.
