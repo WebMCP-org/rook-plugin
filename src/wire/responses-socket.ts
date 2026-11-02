@@ -182,20 +182,27 @@ function respond(
   const send = (message: RequestBody) =>
     socket.send(JSON.stringify({ type: "response.create", ...message }));
   const encoder = new TextEncoder();
-  const done = new AbortController();
-  const listening = { signal: done.signal };
+  let cancelResponse: () => void;
   return new Promise((resolve) => {
     const events = new ReadableStream<Uint8Array>({
       start(controller) {
         let streaming = false;
+        let finished = false;
         const finish = () => {
+          if (finished) return;
+          finished = true;
           conversation.busy = false;
           clearTimeout(silence);
-          done.abort();
+          // Node's signal-based listener cleanup can be collected before
+          // abort. Own removal so a reused socket cannot reach a closed stream.
+          socket.removeEventListener("message", onMessage);
+          socket.removeEventListener("close", onClose);
+          signal?.removeEventListener("abort", aborted);
         };
         // Codex drops the connection on any failure; before the first event
         // the request still has HTTP, after it the turn sees the error.
         const fail = (error: Error) => {
+          if (finished) return;
           finish();
           drop();
           if (streaming) {
@@ -210,6 +217,7 @@ function respond(
           FIRST_EVENT_TIMEOUT_MS,
         );
         const onMessage = (message: MessageEvent) => {
+          if (finished) return;
           const data = String(message.data);
           const event = parseJson(eventSchema, data);
           if (!event) {
@@ -260,20 +268,21 @@ function respond(
             if (event.type === "error") drop();
           }
         };
-        socket.addEventListener("message", onMessage, listening);
-        socket.addEventListener(
-          "close",
-          () => fail(new Error("ChatGPT closed the WebSocket mid-response")),
-          listening,
-        );
+        const onClose = () => fail(new Error("ChatGPT closed the WebSocket mid-response"));
+        socket.addEventListener("message", onMessage);
+        socket.addEventListener("close", onClose);
         // A cancelled turn drops the connection, as Codex does: the socket's
         // cache is only good for the response it was serving.
         const aborted = () => fail(new Error("The request was aborted", { cause: signal?.reason }));
+        cancelResponse = () => {
+          finish();
+          drop();
+        };
         if (signal?.aborted) {
           aborted();
           return;
         }
-        signal?.addEventListener("abort", aborted, listening);
+        signal?.addEventListener("abort", aborted);
         if ("items" in plan) {
           send({ ...body, previous_response_id: plan.responseId, input: plan.items });
           log(`${label} appended ${plan.items.length} items`);
@@ -283,9 +292,7 @@ function respond(
         }
       },
       cancel() {
-        conversation.busy = false;
-        done.abort();
-        drop();
+        cancelResponse();
       },
     });
   });

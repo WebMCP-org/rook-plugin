@@ -6,7 +6,7 @@ allowed-tools: Bash(rook ls:*), Bash(rook ps:*), Bash(rook wait:*), Bash(rook sh
 
 # rook-browser
 
-Rook is an agent in the user's Chrome. Each Chrome profile with Rook is its own Rook, signed in as that profile's email, with its own threads and its own workspace filesystem. If `rook --version` doesn't print `rook 1.1.1005 (@mcp-b/rook)`, use `npx -y @mcp-b/rook@1.1.1005` in place of `rook`.
+Rook is an agent in the user's Chrome. Each Chrome profile with Rook is its own Rook, signed in as that profile's email, with its own threads and its own workspace filesystem. If `rook --version` doesn't print `rook 1.1.1046 (@mcp-b/rook)`, use `npx -y @mcp-b/rook@1.1.1046` in place of `rook`.
 
 ## The loop
 
@@ -102,7 +102,7 @@ rook call search_issues --tab 1234 --args '{"query":"login bug"}'
 
 ## Model
 
-A profile with no model gets what Codex here uses, through `rook serve`, when rook first reaches it; stderr says so. A model chosen in the side panel or set by policy stays.
+A selected profile with no model gets what Codex here uses, through `rook serve`, before its first action; stderr says so. Listing profiles or threads does not change models. A model chosen in the side panel or set by policy stays.
 When the user asks for another, `rook model` lists each profile's, `rook model codex` or `rook model url` sets it after one test request that fails with the upstream's status and body, and `rook model off` takes profiles off serve; `rook model -h` has the flags.
 A variable for `--header-env` must be in `rook serve`'s environment.
 

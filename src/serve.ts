@@ -58,7 +58,11 @@ function refuse(status: number, reason: string): Refusal {
 
 // A page on a rebinding name that resolves to 127.0.0.1 still names itself here.
 function loopbackHost(headers: IncomingHttpHeaders, port: number): boolean {
-  return headers.host === `127.0.0.1:${port}` || headers.host === `localhost:${port}`;
+  return (
+    headers.host === `127.0.0.1:${port}` ||
+    headers.host === `localhost:${port}` ||
+    (port === 80 && (headers.host === "127.0.0.1" || headers.host === "localhost"))
+  );
 }
 
 /** The CLI: no browser Origin, and the token from the token file. */

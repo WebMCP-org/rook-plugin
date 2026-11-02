@@ -13,9 +13,17 @@ export const CONTROL_PATH = "/companion/control";
 export const TUNNEL_PATH = "/companion/tunnel";
 export const AGENTS_PATH_PREFIX = "/agents/";
 export const SEATS_PATH_PREFIX = "/seats/";
-/** Where `rook serve`, the relay on this machine, listens.
- * ponytail: one fixed port; make it a setting when a clash shows up. */
+/** Default loopback endpoint. An isolated build and CLI may choose another port. */
 export const LOCAL_RELAY_ORIGIN = "http://127.0.0.1:7391";
+
+/** Port 0 asks `rook serve` for an OS-assigned port; clients use the reported port. */
+export function localRelayOrigin(port?: string): string {
+  if (port === undefined || port === "") return LOCAL_RELAY_ORIGIN;
+  if (!/^\d+$/.test(port) || Number(port) > 65535) {
+    throw new Error("ROOK_RELAY_PORT must be a TCP port between 0 and 65535");
+  }
+  return new URL(`http://127.0.0.1:${Number(port)}`).origin;
+}
 /** A profile's longest wait between redials of `rook serve`. A refused
  * loopback connect costs nothing, and the first `rook` command after login
  * starts the relay and then waits this long for every opted-in profile. */

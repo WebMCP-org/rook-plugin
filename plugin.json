@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "rook",
-  "version": "1.1.1005",
+  "version": "1.1.1046",
   "description": "Hand web work, files and bash to Rook, the browser agent in your own Chrome profiles.",
   "author": {
     "name": "MCP-B",

@@ -26,6 +26,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { chromeProfiles, openChrome, openUrl, STORE_URL, type ChromeProfile } from "./chrome";
 import { adoptModel, duration, modelCommand, UsageError, type Profile } from "./model";
 import { modelRelay } from "./relay";
+import { LOCAL_RELAY_ORIGIN } from "./local-relay";
 import { HOSTS_PATH, SERVE_HEADER, startLocalRelay } from "./serve";
 import {
   AGENT_CALL_TIMEOUT_MS,
@@ -44,7 +45,6 @@ import {
 } from "./wire/contracts";
 import {
   companionSeatAgentsPrefix,
-  LOCAL_RELAY_ORIGIN,
   LOCAL_RELAY_RECONNECT_MAX_MS,
   TUNNEL_CONNECT_TIMEOUT_MS,
   TUNNEL_HEARTBEAT_ACK,
@@ -250,11 +250,10 @@ function within<T>(promise: Promise<T>, message: string): Promise<T> {
 type Directory = AgentClient<RookDirectory, RookDirectoryState>;
 
 /** The connected profiles, opening Chrome when the one wanted, or any, is not
- * connected. What only the user can do comes back as an Exit saying what.
- * `adopt` gives a profile with no model rook serve's default. */
-async function profiles(wanted: string | undefined, adopt = true): Promise<Profile[]> {
+ * connected. Discovery never changes a profile's model. */
+async function profiles(wanted: string | undefined): Promise<Profile[]> {
   const hosts = await connectedHosts();
-  const connected = await answering(hosts, adopt);
+  const connected = await answering(hosts);
   if (matching(connected, wanted).length) return connected;
   // Chrome is open and Rook in it is stuck: opening Chrome again changes nothing.
   if (hosts.length && !connected.length) {
@@ -269,7 +268,7 @@ async function profiles(wanted: string | undefined, adopt = true): Promise<Profi
   process.stderr.write(`opened Chrome${where}; waiting for Rook to connect\n`);
   const known = new Set(hosts);
   const added = await newHosts(known, CHROME_START_MS);
-  const reached = [...connected, ...(await answering(added, adopt))];
+  const reached = [...connected, ...(await answering(added))];
   if (matching(reached, wanted).length) return reached;
   throw new Exit(
     EXIT.unavailable,
@@ -310,7 +309,7 @@ function chromeToOpen(wanted: string | undefined): ChromeProfile {
 }
 
 /** The profiles behind these hosts that answer; one that hangs is skipped, not fatal. */
-async function answering(hosts: readonly string[], adopt: boolean): Promise<Profile[]> {
+async function answering(hosts: readonly string[]): Promise<Profile[]> {
   const settled = await Promise.allSettled(
     hosts.map(async (id) => {
       const root: Directory = dial(id, AGENT_CLASS_NAME, AGENT_INSTANCE_NAME);
@@ -320,9 +319,7 @@ async function answering(hosts: readonly string[], adopt: boolean): Promise<Prof
       while (directory(root).profileVerification.status === "unknown" && Date.now() < until) {
         await sleep(200);
       }
-      const profile = { id, root, label: label(id, directory(root)) };
-      if (adopt) await adoptModel(profile, HOME);
-      return profile;
+      return { id, root, label: label(id, directory(root)) };
     }),
   );
   const answered: Profile[] = [];
@@ -371,6 +368,13 @@ function pick(all: Profile[], wanted: string | undefined): Profile {
     EXIT.usage,
     `${all.length} profiles are connected: ${choices}. Ask the user which one, then pass --profile <email> on every rook call`,
   );
+}
+
+/** Provision only the uniquely selected profile, after ambiguity is resolved. */
+async function selectProfile(all: Profile[], wanted: string | undefined): Promise<Profile> {
+  const profile = pick(all, wanted);
+  await adoptModel(profile, HOME);
+  return profile;
 }
 
 /** A thread id or unique prefix, searched in every profile unless one is named. */
@@ -826,13 +830,14 @@ function printRows<T>(rows: readonly T[], json: boolean, line: (row: T) => strin
 /** The thread `--thread` names, or a new one (`--id`'s, if given) on the
  * profile `--profile` picks. The id is out before the run starts: a harness
  * that kills this process still has what `rook wait` needs. */
-function target(
+async function target(
   all: Profile[],
   flags: { profile?: string; thread?: string; id?: string; json: boolean },
 ) {
   const found = flags.thread
     ? locate(all, flags.profile, flags.thread)
     : { profile: pick(all, flags.profile), threadId: flags.id ?? randomUUID() };
+  await adoptModel(found.profile, HOME);
   if (!flags.json) process.stderr.write(`thread ${found.threadId} on ${found.profile.label}\n`);
   return found;
 }
@@ -843,7 +848,7 @@ async function main(argv: string[]): Promise<number> {
       home: HOME,
       token,
       // `rook model` sets profiles' models itself.
-      profiles: async (wanted) => matching(await profiles(wanted, false), wanted),
+      profiles: async (wanted) => matching(await profiles(wanted), wanted),
     });
   }
   const { values, positionals } = parseArgs({
@@ -886,15 +891,15 @@ async function main(argv: string[]): Promise<number> {
 
   switch (command) {
     case "serve": {
-      const port = Number(RELAY.port);
+      const port = Number(RELAY.port || "80");
       const options = { port, token: token(), model: modelRelay(HOME) };
-      await startLocalRelay(options).catch((error: NodeJS.ErrnoException) => {
+      const relay = await startLocalRelay(options).catch((error: NodeJS.ErrnoException) => {
         throw error.code === "EADDRINUSE"
           ? new Exit(EXIT.unavailable, `port ${port} is taken; is rook serve already running?`)
           : error;
       });
       process.stderr.write(
-        `rook serve ${packageJson.version} listening on ${LOCAL_RELAY_ORIGIN}\n`,
+        `rook serve ${packageJson.version} listening on http://127.0.0.1:${relay.port}\n`,
       );
       return new Promise<number>(() => {});
     }
@@ -948,7 +953,7 @@ async function main(argv: string[]): Promise<number> {
       if (!typed) {
         throw new Exit(EXIT.usage, "usage: rook ask PROMPT (or pipe the prompt on stdin)");
       }
-      const { profile, threadId } = target(await profiles(values.profile), values);
+      const { profile, threadId } = await target(await profiles(values.profile), values);
       // A repeated --id was already submitted; report the thread as it is.
       const since = Date.now();
       const repeat = values.thread
@@ -996,7 +1001,7 @@ async function main(argv: string[]): Promise<number> {
     case "bash": {
       const script = rest.join(" ");
       if (!script) throw new Exit(EXIT.usage, "usage: rook bash SCRIPT");
-      const profile = pick(await profiles(values.profile), values.profile);
+      const profile = await selectProfile(await profiles(values.profile), values.profile);
       // A shell pipe or a redirected file feeds the script. A terminal,
       // /dev/null or a socket feeds nothing, because Node-based harnesses can
       // hand their commands a socket they hold open.
@@ -1016,7 +1021,7 @@ async function main(argv: string[]): Promise<number> {
       if (!rest[0]) throw new Exit(EXIT.usage, "usage: rook run PATH [--args JSON]");
       if (values.id) throw new Exit(EXIT.usage, "--id is for rook ask; a script runs each time");
       const args = toolInput(values.args);
-      const { profile, threadId } = target(await profiles(values.profile), values);
+      const { profile, threadId } = await target(await profiles(values.profile), values);
       // The side panel's Run button: the script runs in Chrome, so giving up
       // here, on --timeout or Ctrl-C, leaves it running.
       // Rook checks the path, as for the Run button, before minting a thread.
@@ -1066,7 +1071,7 @@ async function main(argv: string[]): Promise<number> {
     }
     case "tools": {
       const tab = tabId(values.tab);
-      const profile = pick(await profiles(values.profile), values.profile);
+      const profile = await selectProfile(await profiles(values.profile), values.profile);
       printRows(await tools(profile, tab), values.json, (tool) => {
         const about = tool.description?.replace(/\s+/gu, " ").trim() ?? "";
         return `${tool.name}\t${source(tool)}\t${about}`;
@@ -1078,7 +1083,7 @@ async function main(argv: string[]): Promise<number> {
       if (!name) throw new Exit(EXIT.usage, "usage: rook call NAME [--tab N] [--server S]");
       const input = toolInput(values.args);
       const tab = tabId(values.tab);
-      const profile = pick(await profiles(values.profile), values.profile);
+      const profile = await selectProfile(await profiles(values.profile), values.profile);
       const found = (await tools(profile, tab)).filter(
         (tool) =>
           tool.name === name && (values.server === undefined || tool.serverId === values.server),

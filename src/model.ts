@@ -1,9 +1,10 @@
 // `rook model`: the model `rook serve` gives each Chrome profile (ADR 0082).
 // serve's upstreams live in ROOK_HOME's model.json, one of each kind, named by
 // it; a profile on serve has an openai-compatible source at /<kind>/v1 with
-// its own model and effort. A profile with no model gets the default when rook
-// first reaches it: what Codex here is configured to use. rook never replaces a model chosen in the side panel or set by
-// managed policy, so a profile it takes off serve goes back to none.
+// its own model and effort. A selected profile with no model gets the default
+// before an action: what Codex here is configured to use. Discovery does not
+// change models. rook never replaces a model chosen in the side panel or set
+// by managed policy, so a profile it takes off serve goes back to none.
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -22,7 +23,7 @@ import {
   type RookDirectoryState,
   type RookModelSource,
 } from "./wire/contracts";
-import { LOCAL_RELAY_ORIGIN } from "./wire/relay";
+import { LOCAL_RELAY_ORIGIN } from "./local-relay";
 import { parseJson } from "./wire/responses-socket";
 import {
   MODEL_FILE,

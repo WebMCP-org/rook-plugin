@@ -31,6 +31,19 @@ const extension = {
 };
 
 describe("admitUpgrade", () => {
+  it("accepts an omitted HTTP default port only when listening on port 80", () => {
+    for (const host of ["127.0.0.1", "localhost"]) {
+      expect(admitUpgrade(CONTROL_PATH, { ...extension, host }, 80, TOKEN)).toMatchObject({
+        ok: true,
+      });
+      expect(admitModel({ ...cli, host }, 80, TOKEN)).toBeNull();
+      expect(admitUpgrade(CONTROL_PATH, { ...extension, host }, PORT, TOKEN)).toMatchObject({
+        status: 403,
+      });
+      expect(admitModel({ ...cli, host }, PORT, TOKEN)).toMatchObject({ status: 403 });
+    }
+  });
+
   it("admits a Rook extension on loopback as the host it names", () => {
     expect(admitUpgrade(CONTROL_PATH, extension, PORT, TOKEN)).toEqual({
       ok: true,
