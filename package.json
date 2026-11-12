@@ -1,6 +1,6 @@
 {
   "name": "@mcp-b/rook",
-  "version": "1.1.1105",
+  "version": "1.1.1147",
   "description": "Hand web work, files and bash to Rook, the browser agent in your own Chrome profiles.",
   "keywords": [
     "agent-skills",
@@ -42,12 +42,12 @@
   },
   "devDependencies": {
     "@ai-sdk/openai": "4.0.89",
-    "@cloudflare/codemode": "https://github.com/WebMCP-org/do-runtime/releases/download/rook-sdk-abba5d67d9d6/cloudflare-codemode-0.5.3.tgz",
+    "@cloudflare/codemode": "https://github.com/WebMCP-org/do-runtime/releases/download/rook-sdk-69eb6a0040fe/cloudflare-codemode-0.5.6.tgz",
     "@openai-oauth/core": "2.0.0",
     "@openai-oauth/local": "2.0.0",
     "@types/node": "26.6.4",
     "@types/ws": "8.18.2",
-    "agents": "https://github.com/WebMCP-org/do-runtime/releases/download/rook-sdk-abba5d67d9d6/agents-0.27.0.tgz",
+    "agents": "https://github.com/WebMCP-org/do-runtime/releases/download/rook-sdk-69eb6a0040fe/agents-0.32.0.tgz",
     "ai": "7.0.133",
     "just-bash": "https://github.com/WebMCP-org/just-bash/releases/download/rook-native-mounts-2e70eea11e4e/just-bash-3.4.2.tgz",
     "smol-toml": "1.9.0",

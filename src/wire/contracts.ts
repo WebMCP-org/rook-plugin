@@ -88,7 +88,7 @@ export interface WorkspaceExecutionResult {
 
 // ── The root Agent: one per Chrome profile ──────────────────────────────────
 
-type RookThreadStatus = "idle" | "running" | "attention" | "error" | "interrupted";
+type RookThreadStatus = "idle" | "running" | "attention" | "error" | "interrupted" | "exhausted";
 
 export type RookDirectoryState = {
   threads: readonly {
