@@ -12,7 +12,7 @@ import { text as readStream } from "node:stream/consumers";
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseArgs } from "node:util";
 import { MessageType, type IncomingMessage, type OutgoingMessage } from "agents/chat";
-import { AgentClient } from "agents/client";
+import { AgentClient, type CallOptions } from "agents/client";
 import {
   getToolName,
   isFileUIPart,
@@ -95,6 +95,7 @@ const USAGE = `rook ${packageJson.version}: hand web work to Rook in your Chrome
 
 --profile takes a profile's email (or ROOK_PROFILE); with one profile it is optional.
 --id makes an ask safe to repeat: a second ask with the same id reports the first.
+TRACEPARENT carries caller trace context for ask and run.
 When no profile is connected, rook opens Chrome (that profile, with --profile), or
 Rook's Chrome Web Store page when Rook is not installed, and says what is left to do.
 Without a terminal, ask and wait stop waiting after 100s; --timeout 0 waits on.
@@ -575,9 +576,15 @@ function rethrow(profile: Profile, error: unknown): never {
 }
 
 /** Whether Rook took the message; false when `messageId` was already submitted. */
-async function submitted(profile: Profile, threadId: string, messageId: string, text: string) {
-  const taken = await profile.root.stub
-    .submitMessage(threadId, messageId, text)
+async function submitted(
+  profile: Profile,
+  threadId: string,
+  messageId: string,
+  text: string,
+  trace: CallOptions | undefined,
+) {
+  const taken = await profile.root
+    .call("submitMessage", [threadId, messageId, text], trace)
     .catch((error: unknown) => rethrow(profile, error));
   // An older Rook's submitMessage resolves nothing, which would read as a repeat.
   if (taken === undefined) throw outdated(profile);
@@ -888,6 +895,9 @@ async function main(argv: string[]): Promise<number> {
     waitHuman: values["wait-human"],
     timeoutMs,
   };
+  const traceparent = process.env.TRACEPARENT;
+  // Bound the carrier on the wire. The receiving host validates W3C context.
+  const trace = traceparent?.length === 55 ? { traceparent } : undefined;
 
   switch (command) {
     case "serve": {
@@ -957,10 +967,10 @@ async function main(argv: string[]): Promise<number> {
       // A repeated --id was already submitted; report the thread as it is.
       const since = Date.now();
       const repeat = values.thread
-        ? !(await submitted(profile, threadId, values.id ?? randomUUID(), typed))
+        ? !(await submitted(profile, threadId, values.id ?? randomUUID(), typed, trace))
         : directory(profile.root).threads.some(({ id }) => id === threadId);
       if (!values.thread && !repeat) {
-        await profile.root.stub.startThread(threadId, { text: typed, files: [] });
+        await profile.root.call("startThread", [threadId, { text: typed, files: [] }], trace);
       }
       if (values.json) {
         emit(threadId, {
@@ -1025,7 +1035,10 @@ async function main(argv: string[]): Promise<number> {
       // The side panel's Run button: the script runs in Chrome, so giving up
       // here, on --timeout or Ctrl-C, leaves it running.
       // Rook checks the path, as for the Run button, before minting a thread.
-      const run = profile.root.call("runAutomation", [threadId, rest[0], args], { timeout: 0 });
+      const run = profile.root.call("runAutomation", [threadId, rest[0], args], {
+        timeout: 0,
+        ...trace,
+      });
       // A script's return value reaches only the caller waiting on it, so
       // only an explicit --timeout gives up on one.
       const runTimeoutMs = duration(values.timeout);
