@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "rook",
-  "version": "1.1.1200",
+  "version": "1.1.1247",
   "description": "Hand web work, files and bash to Rook, the browser agent in your own Chrome profiles.",
   "author": {
     "name": "MCP-B",
@@ -17,7 +17,7 @@
       "interface": {
         "displayName": "Rook",
         "shortDescription": "Hand web work to the browser agent in your Chrome",
-        "longDescription": "Rook is a browser agent in your own Chrome, signed in as you. This plugin's rook-browser skill drives it through the rook CLI: sites behind your login, pages that need a real browser, Playwright code, a page's WebMCP tools, and files in Rook's workspace. It needs Google Chrome with the Rook extension and Node.js 22.18 or later.",
+        "longDescription": "Rook is a browser agent in your own Chrome, signed in as you. This plugin's rook-browser skill drives it through the rook CLI: sites behind your login, pages that need a real browser, Playwright code, a page's WebMCP tools, and files in Rook's workspace. It needs Google Chrome with the Rook extension and Node.js 22.19 or later.",
         "developerName": "MCP-B",
         "category": "Productivity",
         "capabilities": ["Interactive", "Read", "Write"],

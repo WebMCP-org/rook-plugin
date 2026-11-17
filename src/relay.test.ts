@@ -1,7 +1,7 @@
 // Rook's calls through `rook serve`'s model relay to real local upstreams: a
 // Responses server over HTTP and WebSocket, and a chat server.
 import { once } from "node:events";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
   createServer,
   type IncomingHttpHeaders,
@@ -10,24 +10,22 @@ import {
 } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Duplex } from "node:stream";
+import { Effect, Exit, Scope } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
-import { testModel, writeConfig, type Selection } from "./model";
-import {
-  MODEL_FILE,
-  modelRelay,
-  type HeaderSource,
-  type Upstream,
-} from "./relay";
+import { testModel } from "./model-probe";
+import { testRelay, writeModelFixture, modelTestLayer } from "./relay-test-fixture";
+import { MODEL_FILE, type HeaderSource, type Selection, type Upstream } from "./model-settings";
 
 const jsonSchema = z.json();
 type Json = z.infer<typeof jsonSchema>;
 const bodySchema = z.record(z.string(), jsonSchema);
 
-const cleanups: (() => void)[] = [];
-afterEach(() => {
-  for (const cleanup of cleanups.splice(0)) cleanup();
+const cleanups: (() => void | Promise<void>)[] = [];
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   vi.unstubAllEnvs();
 });
 
@@ -66,13 +64,14 @@ async function listen(
 /** serve's model relay over `upstreams`, mounted at the root as serve mounts it. */
 async function relay(upstreams: Record<string, Upstream>) {
   const home = mkdtempSync(join(tmpdir(), "rook-relay-"));
-  writeConfig(home, { version: 1, upstreams, off: [] });
-  const logs: string[] = [];
-  const model = modelRelay(home, (line) => logs.push(line));
-  const server = createServer((request, response) => {
-    void model(request, response, request.url ?? "/");
-  });
-  return { origin: await serve(server), home, logs };
+  writeModelFixture(home, { version: 1, upstreams, off: [] });
+  const scope = Scope.makeUnsafe();
+  cleanups.push(() => Effect.runPromise(Scope.close(scope, Exit.void)));
+  cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+  const local = await Effect.runPromise(
+    Scope.provide(testRelay({ port: 0, token: "serve-token", home }), scope),
+  );
+  return { origin: `http://127.0.0.1:${local.port}`, home, port: local.port };
 }
 
 const post = (url: string, body: string, headers: Record<string, string> = {}) =>
@@ -133,7 +132,12 @@ describe("a url upstream's headers", () => {
       ]),
     });
     const call = async (name: string) =>
-      (await post(`${origin}/${name}/v1/chat/completions?trace=1`, '{"model":"m"}')).status;
+      (
+        await post(
+          `${origin}/${name}/v1/chat/completions?trace=1&api-version=caller`,
+          '{"model":"m"}',
+        )
+      ).status;
 
     expect([await call("url"), await call("url")]).toEqual([200, 200]);
     expired = "refreshed-1";
@@ -145,9 +149,12 @@ describe("a url upstream's headers", () => {
       "refreshed-2",
     ]);
     expect(upstream.seen[0]).toMatchObject({
-      url: "/v1/chat/completions?trace=1&api-version=2026-01-01",
       headers: { "x-team": "rook", authorization: "Bearer key-1" },
     });
+    const target = new URL(upstream.seen[0].url, upstream.origin);
+    expect(target.pathname).toBe("/v1/chat/completions");
+    expect(target.searchParams.getAll("api-version")).toEqual(["2026-01-01"]);
+    expect(target.searchParams.getAll("trace")).toEqual(["1"]);
     expect(upstream.seen[0].headers).not.toHaveProperty("x-trace");
 
     await call("timed");
@@ -157,6 +164,50 @@ describe("a url upstream's headers", () => {
     expect(timed.map(({ headers }) => headers["x-token"])).toEqual(["timed-1", "timed-2"]);
     // serve's own token stays with serve.
     expect(timed[0].headers).not.toHaveProperty("authorization");
+  });
+
+  it("runs a header command once for concurrent calls after its ttl or a 401", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rook-headers-shared-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    // Logs each run, and is slow enough that concurrent calls overlap it.
+    const counting = (name: string) => {
+      const file = join(dir, name);
+      return `echo run >> '${file}'; sleep 0.3; echo ${name}-$(wc -l < '${file}' | tr -d ' ')`;
+    };
+    const runs = (name: string) => readFileSync(join(dir, name), "utf8").split("\n").length - 1;
+    let expired = "";
+    const upstream = await listen((seen, response) => {
+      response.writeHead(seen.headers["x-token"] === expired ? 401 : 200);
+      response.end();
+    });
+    const { origin } = await relay({
+      timed: chatUpstream(upstream.origin, [
+        { name: "x-token", command: counting("timed"), ttl: 1 },
+      ]),
+      refreshed: chatUpstream(upstream.origin, [
+        { name: "x-token", command: counting("refreshed") },
+      ]),
+    });
+    const calls = (name: string) =>
+      Promise.all(
+        Array.from(
+          { length: 5 },
+          async () => (await post(`${origin}/${name}/v1/chat/completions`, "{}")).status,
+        ),
+      );
+
+    expect(await calls("timed")).toEqual([200, 200, 200, 200, 200]);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(await calls("timed")).toEqual([200, 200, 200, 200, 200]);
+    expect(runs("timed")).toBe(2);
+
+    expect(await calls("refreshed")).toEqual([200, 200, 200, 200, 200]);
+    expired = "refreshed-1";
+    expect(await calls("refreshed")).toEqual([200, 200, 200, 200, 200]);
+    expect(runs("refreshed")).toBe(2);
+    expect(upstream.seen.slice(-5).map(({ headers }) => headers["x-token"])).toEqual(
+      Array(5).fill("refreshed-2"),
+    );
   });
 
   it("refuses a call whose header variable rook serve lacks, naming it", async () => {
@@ -204,13 +255,13 @@ async function responsesServer() {
       for (const event of events) socket.send(JSON.stringify(event));
     });
   });
-  return { ...upstream, handshakes, messages };
+  return { ...upstream, handshakes, messages, sockets };
 }
 
 describe.each(["ws", "http"] as const)("a Responses url upstream over %s", (transport) => {
   it("carries a streamed call that way and a plain one over HTTP, with its headers and query", async () => {
     const upstream = await responsesServer();
-    const { origin, logs } = await relay({
+    const { origin } = await relay({
       url: {
         kind: "url",
         baseUrl: `${upstream.origin}/v1`,
@@ -241,11 +292,9 @@ describe.each(["ws", "http"] as const)("a Responses url upstream over %s", (tran
       });
       expect(upstream.messages).toEqual([{ type: "response.create", model: "m", input: [] }]);
       expect(upstream.seen.map(over)).toEqual([expected]);
-      expect(logs).toEqual([expect.stringContaining("sent in full")]);
     } else {
       expect(upstream.handshakes).toEqual([]);
       expect(upstream.seen.map(over)).toEqual([expected, expected]);
-      expect(logs).toEqual([]);
     }
   });
 });
@@ -262,7 +311,11 @@ describe("modelRelay", () => {
     const call = (path: string) => post(`${origin}${path}`, "{}");
 
     expect(await (await call("/url/v1/chat/completions")).text()).toBe("first");
-    writeConfig(home, { version: 1, upstreams: { url: chatUpstream(second.origin) }, off: [] });
+    writeModelFixture(home, {
+      version: 1,
+      upstreams: { url: chatUpstream(second.origin) },
+      off: [],
+    });
     expect(await (await call("/url/v1/chat/completions")).text()).toBe("second");
     for (const path of ["/codex/v1/responses", "/__proto__/v1/responses", "/url/v2/chat", "/"]) {
       expect((await call(path)).status).toBe(404);
@@ -277,9 +330,12 @@ describe("rook model's test request", () => {
     const sse = (...types: string[]) =>
       types.map((type) => `data: ${JSON.stringify({ type, response: { id: "r" } })}\n\n`).join("");
     const answers: [number, string][] = [
-      [200, sse("response.created", "response.completed")],
+      [200, `retry: 1000\n\n${sse("response.created", "response.completed")}`],
       [401, '{"error":{"message":"invalid key"}}'],
-      [200, sse("response.created", "response.failed")],
+      [
+        200,
+        `${sse("response.created")}data: ${JSON.stringify({ type: "response.failed", response: { id: "r", error: { code: "model_not_found", message: "corp-model is not available to this account" } } })}\n\n`,
+      ],
       [200, sse("response.created")],
     ];
     const upstream = await listen((_seen, response, n) => {
@@ -298,14 +354,19 @@ describe("rook model's test request", () => {
       },
       choice: { upstream: "url", model: "corp-model", effort: "low" },
     };
-    const { origin } = await relay({ url: chosen.upstream });
-    const test = () => testModel(chosen, "serve-token", origin);
+    const local = await relay({});
+    const test = () =>
+      Effect.runPromise(
+        testModel(chosen).pipe(
+          Effect.provide(modelTestLayer(local.home, local.port, "serve-token")),
+        ),
+      );
 
     await test();
     await expect(test()).rejects.toThrow(
       'the url upstream answered 401: {"error":{"message":"invalid key"}}',
     );
-    await expect(test()).rejects.toThrow("the url upstream failed");
+    await expect(test()).rejects.toThrow("corp-model is not available to this account");
     await expect(test()).rejects.toThrow("ended its stream before the response finished");
     expect(bodyOf(upstream.seen[0])).toEqual({
       model: "corp-model",
@@ -327,13 +388,207 @@ describe("rook model's test request", () => {
       upstream: chatUpstream(upstream.origin),
       choice: { upstream: "url", model: "corp-model", effort: "low" },
     };
-    const { origin } = await relay({ url: chosen.upstream });
-    await testModel(chosen, "serve-token", origin);
+    const local = await relay({});
+    const test = (selection: Selection) =>
+      Effect.runPromise(
+        testModel(selection).pipe(
+          Effect.provide(modelTestLayer(local.home, local.port, "serve-token")),
+        ),
+      );
+    await test(chosen);
     expect(upstream.seen.map(({ url }) => url)).toEqual(["/v1/chat/completions"]);
     expect(bodyOf(upstream.seen[0])).toEqual({
       model: "corp-model",
       messages: [{ role: "user", content: "Reply with the word ready." }],
       reasoning_effort: "low",
     });
+    // serve's own refusal reads as a failed test, not as the upstream's answer.
+    vi.stubEnv("ROOK_TEST_UNSET", undefined);
+    await expect(
+      test({
+        ...chosen,
+        upstream: chatUpstream(upstream.origin, [{ name: "x-key", env: "ROOK_TEST_UNSET" }]),
+      }),
+    ).rejects.toThrow(
+      "the url upstream test failed: rook serve has no ROOK_TEST_UNSET in its environment",
+    );
+    expect(upstream.seen).toHaveLength(1);
+  });
+});
+
+describe("model call cancellation", () => {
+  it("cancels an upstream response when the caller disconnects", async () => {
+    const disconnected = Promise.withResolvers<void>();
+    const upstream = await listen((_seen, response) => {
+      response.on("close", () => disconnected.resolve());
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write("data: waiting\n\n");
+    });
+    const local = await relay({ corp: chatUpstream(upstream.origin) });
+    const controller = new AbortController();
+    try {
+      const reply = await fetch(`${local.origin}/corp/v1/chat/completions`, {
+        method: "POST",
+        headers: { authorization: "Bearer serve-token" },
+        body: "{}",
+        signal: controller.signal,
+      });
+      expect(reply.status).toBe(200);
+      controller.abort();
+      await disconnected.promise;
+    } finally {
+      controller.abort();
+    }
+  });
+
+  it("terminates the header shell and its child when the caller disconnects", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rook-header-cancel-"));
+    const started = join(dir, "started");
+    const stopped = join(dir, "stopped");
+    const script = join(dir, "header.cjs");
+    writeFileSync(
+      script,
+      `
+      const fs = require("node:fs");
+      const timer = setInterval(() => {}, 1000);
+      process.on("SIGTERM", () => {
+        fs.writeFileSync(${JSON.stringify(stopped)}, "stopped");
+        clearInterval(timer);
+      });
+      fs.writeFileSync(${JSON.stringify(started)}, "started");
+    `,
+    );
+    const upstream = await listen((_seen, response) => {
+      response.end("unexpected");
+    });
+    const quote = (word: string) => "'" + word.replaceAll("'", "'\\''") + "'";
+    const local = await relay({
+      corp: chatUpstream(upstream.origin, [
+        {
+          name: "authorization",
+          command: `${quote(process.execPath)} ${quote(script)}; true`,
+        },
+      ]),
+    });
+    const controller = new AbortController();
+    const request = fetch(`${local.origin}/corp/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: "Bearer serve-token" },
+      body: "{}",
+      signal: controller.signal,
+    }).catch(() => undefined);
+    try {
+      await expect.poll(() => existsSync(started)).toBe(true);
+      controller.abort();
+      await request;
+      await expect.poll(() => existsSync(stopped)).toBe(true);
+      expect(upstream.seen).toEqual([]);
+    } finally {
+      controller.abort();
+      await request;
+    }
+  });
+});
+
+describe("model relay scope", () => {
+  it.each([false, true])(
+    "closes a cached idle upstream socket, unresponsive peer=%s",
+    async (unresponsive) => {
+      const upstream = await responsesServer();
+      const home = mkdtempSync(join(tmpdir(), "rook-relay-idle-"));
+      cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+      writeModelFixture(home, {
+        version: 1,
+        upstreams: { url: { ...chatUpstream(upstream.origin), api: "responses", transport: "ws" } },
+        off: [],
+      });
+      const scope = Scope.makeUnsafe();
+      try {
+        const local = await Effect.runPromise(
+          Scope.provide(
+            testRelay({
+              port: 0,
+              token: "serve-token",
+              home,
+            }),
+            scope,
+          ),
+        );
+        const response = await post(
+          `http://127.0.0.1:${local.port}/url/v1/responses`,
+          '{"model":"m","input":[],"stream":true}',
+          { "session-id": "idle-scope" },
+        );
+        expect(await response.text()).toContain('"type":"response.completed"');
+        expect(upstream.sockets.clients.size).toBe(1);
+        if (unresponsive) for (const socket of upstream.sockets.clients) socket.pause();
+        let closed = false;
+        const closing = Effect.runPromise(Scope.close(scope, Exit.void)).then(() => {
+          closed = true;
+        });
+        // The upstream deliberately ignores a WebSocket close handshake. Local
+        // disposal must finish before this test allows that peer to read again.
+        await expect.poll(() => closed).toBe(true);
+        await closing;
+        for (const socket of upstream.sockets.clients) socket.resume();
+        await expect.poll(() => upstream.sockets.clients.size).toBe(0);
+      } finally {
+        for (const socket of upstream.sockets.clients) socket.terminate();
+        await Effect.runPromise(Scope.close(scope, Exit.void));
+      }
+    },
+  );
+
+  it("cancels an upstream handshake still waiting for HTTP upgrade", async () => {
+    const upstream = createServer();
+    const accepted = Promise.withResolvers<Duplex>();
+    upstream.on("upgrade", (_request, socket) => {
+      socket.on("error", () => {});
+      // Deliberately keep the peer's writable half open even after receiving
+      // FIN. The relay must release its own connection without its cooperation.
+      socket.resume();
+      accepted.resolve(socket);
+    });
+    const origin = await serve(upstream);
+    const home = mkdtempSync(join(tmpdir(), "rook-relay-handshake-"));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    writeModelFixture(home, {
+      version: 1,
+      upstreams: { url: { ...chatUpstream(origin), api: "responses", transport: "ws" } },
+      off: [],
+    });
+    const scope = Scope.makeUnsafe();
+    const local = await Effect.runPromise(
+      Scope.provide(
+        testRelay({
+          port: 0,
+          token: "serve-token",
+          home,
+        }),
+        scope,
+      ),
+    );
+    const request = post(
+      `http://127.0.0.1:${local.port}/url/v1/responses`,
+      '{"model":"m","input":[],"stream":true}',
+      { "session-id": "handshake-scope" },
+    )
+      .then((response) => response.text())
+      .catch(() => undefined);
+    const socket = await accepted.promise;
+    let closed = false;
+    const closing = Effect.runPromise(Scope.close(scope, Exit.void)).then(() => {
+      closed = true;
+    });
+    try {
+      await expect.poll(() => closed).toBe(true);
+      await expect.poll(() => socket.readableEnded || socket.destroyed).toBe(true);
+      await closing;
+      await request;
+    } finally {
+      socket.destroy();
+      await closing;
+      await request;
+    }
   });
 });

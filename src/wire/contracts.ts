@@ -4,7 +4,7 @@
 // unnoticed. No relative imports: Node loads this file directly as TypeScript.
 import type { MCPServersState } from "agents";
 import type { MCPClientManager } from "agents/mcp/client";
-import type { FileUIPart } from "ai";
+import type { FileUIPart, UIMessage } from "ai";
 import { z } from "zod";
 
 // ── Agent addresses ─────────────────────────────────────────────────────────
@@ -88,6 +88,10 @@ export interface WorkspaceExecutionResult {
 
 // ── The root Agent: one per Chrome profile ──────────────────────────────────
 
+/** A title someone sets on a thread: the model's `set_thread_title`, or a
+ * client's rename. The roster's own field stays a plain string. */
+export const threadTitleSchema = z.string().trim().min(1).max(48);
+
 type RookThreadStatus = "idle" | "running" | "attention" | "error" | "interrupted" | "exhausted";
 
 export type RookDirectoryState = {
@@ -121,6 +125,10 @@ export type RookDirectory = {
     path: string,
     args?: McpToolInput,
   ): Promise<WorkspaceExecutionResult>;
+  /** Removes the thread and its conversation; run traces under /executions stay. */
+  deleteThread(id: string): Promise<void>;
+  /** Rook parses the title with `threadTitleSchema`. */
+  renameThread(id: string, title: string): Promise<void>;
   listTools(): Promise<McpToolDescriptor[]>;
   callTool(
     serverId: string,
@@ -132,7 +140,9 @@ export type RookDirectory = {
     stdin: string,
   ): Promise<{ stdout: string; stderr: string; exitCode: number }>;
   /** Null clears the endpoint, back to the ChatGPT sign-in. */
-  setOpenAiCompatibleModelSource(input: OpenAiCompatibleModelInput | null): Promise<RookModelSource>;
+  setOpenAiCompatibleModelSource(
+    input: OpenAiCompatibleModelInput | null,
+  ): Promise<RookModelSource>;
 };
 
 // ── A conversation Agent: one per thread ────────────────────────────────────
@@ -144,6 +154,13 @@ export type RookConversationState = {
 
 export type RookConversation = {
   turnOutcome(): Promise<"running" | "completed" | "error" | "aborted">;
+  /** Think's record of one submitted message, by the id it was sent with. */
+  inspectSubmission(submissionId: string): Promise<{
+    status: "pending" | "running" | "completed" | "aborted" | "skipped" | "error";
+    error?: string;
+  } | null>;
+  /** The transcript as stored, which a client connecting mid-turn is not sent. */
+  getMessages(): Promise<UIMessage[]>;
   /** Resolves once the turn and its scripts have stopped. */
   stopCurrentWork(): Promise<void>;
 };

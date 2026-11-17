@@ -1,292 +1,278 @@
-// `rook serve`'s model relay (ADR 0082). A profile's openai-compatible source
-// points at /<upstream>/v1 on serve, and each call goes on to the upstream of
-// that name in ~/.rook/model.json, read per call so `rook model` needs no
-// restart: ChatGPT through this machine's Codex sign-in, any URL with the
-// headers it needs. Calls go on as the extension made them. The benchmarks run
-// the codex upstream alone (scripts/responses-relay.ts), so this module loads
-// under plain `node`.
-import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:http";
-import { join } from "node:path";
-import { promisify } from "node:util";
+// Model transport belongs to the daemon scope. HTTP routing and model selection
+// share this service, so testing a candidate never publishes it to model.json.
 import { createOpenAIOAuthTransport } from "@openai-oauth/core";
 import { openaiCredentials } from "@openai-oauth/local";
-import { z } from "zod";
-import { connectNodeWebSocket, responsesOverWebSocket } from "./wire/responses-socket.ts";
+import {
+  Cache,
+  Clock,
+  Config,
+  Context,
+  Data,
+  Duration,
+  Effect,
+  Exit,
+  Layer,
+  Option,
+  Scope,
+  ScopedCache,
+} from "effect";
+import {
+  FetchHttpClient,
+  Headers,
+  HttpClient,
+  HttpClientRequest,
+  HttpClientResponse,
+  HttpMethod,
+  HttpServerRequest,
+  HttpServerResponse,
+} from "effect/http";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { type HeaderSource, type Upstream, upstreamSchema } from "./model-settings.ts";
+import { connectNodeWebSocket } from "./node-responses-socket.ts";
+import { responsesOverWebSocket } from "./wire/responses-socket.ts";
 
-/** serve's upstreams and what `rook model` chose, in ROOK_HOME. */
-export const MODEL_FILE = "model.json";
+class ModelTransportError extends Data.TaggedError("ModelTransportError")<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
 
-/** A header an upstream needs: a value, an environment variable of serve's, or a command's output. */
-const headerSourceSchema = z.union([
-  z.strictObject({ name: z.string().min(1), value: z.string() }),
-  z.strictObject({
-    name: z.string().min(1),
-    env: z.string().min(1),
-    prefix: z.string().optional(),
-    // Codex's env_http_headers: sent only when the variable is set.
-    optional: z.boolean().optional(),
-  }),
-  z.strictObject({
-    name: z.string().min(1),
-    command: z.string().min(1),
-    prefix: z.string().optional(),
-    /** Milliseconds before the command runs again; it always does after a 401. */
-    ttl: z.number().positive().optional(),
-  }),
-]);
+const transportError = (cause: unknown) =>
+  new ModelTransportError({
+    message: cause instanceof Error ? cause.message : String(cause),
+    cause,
+  });
 
-export type HeaderSource = z.infer<typeof headerSourceSchema>;
+/** A header command's trimmed output and when its run finished. */
+type Output = { readonly value: string; readonly at: number };
 
-const upstreamSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("codex"), transport: z.enum(["ws", "http"]) }),
-  z.strictObject({
-    kind: z.literal("url"),
-    // The URL that ends in /v1.
-    baseUrl: z.url(),
-    api: z.enum(["responses", "chat"]),
-    transport: z.enum(["http", "ws"]),
-    headers: z.array(headerSourceSchema),
-    query: z.record(z.string(), z.string()),
-  }),
-]);
+type Send = (
+  upstream: Upstream,
+  request: HttpClientRequest.HttpClientRequest,
+) => Effect.Effect<HttpClientResponse.HttpClientResponse, ModelTransportError, Scope.Scope>;
 
-export type Upstream = z.infer<typeof upstreamSchema>;
-type UrlUpstream = Extract<Upstream, { kind: "url" }>;
-
-const choiceSchema = z.strictObject({
-  upstream: z.string().min(1),
-  model: z.string().min(1),
-  effort: z.string().min(1).optional(),
-});
-
-/** A profile's model on serve: an upstream, a model, and an effort. */
-export type Choice = z.infer<typeof choiceSchema>;
-
-export const modelConfigSchema = z.strictObject({
-  version: z.literal(1),
-  upstreams: z.record(z.string(), upstreamSchema),
-  // What a profile with no model gets when rook reaches it: null after
-  // `rook model off`, unset until rook finds one in Codex's configuration.
-  default: choiceSchema.nullable().optional(),
-  // Profiles `rook model off` took off serve, which rook leaves without one.
-  off: z.array(z.string()),
-});
-
-export type ModelConfig = z.infer<typeof modelConfigSchema>;
-
-export function readConfig(home: string): ModelConfig {
-  const file = join(home, MODEL_FILE);
-  if (!existsSync(file)) return { version: 1, upstreams: {}, off: [] };
-  return modelConfigSchema.parse(JSON.parse(readFileSync(file, "utf8")));
-}
-
-/** Answers one call; `path` is below what the caller mounted, query included. */
-export type ModelEndpoint = (
-  request: IncomingMessage,
-  response: ServerResponse,
-  path: string,
-) => Promise<void>;
-
-type Log = (line: string) => void;
-
+/** How long a header command may run, and how long it has to exit once killed. */
+const HEADER_COMMAND_TIMEOUT = "30 seconds";
+const HEADER_COMMAND_KILL_GRACE = "1 second";
+/** Request headers a model call keeps; serve's own authorization stays with serve. */
 const FORWARDED_HEADERS = ["content-type", "session-id"];
 
-// ── Calls ──────────────────────────────────────────────────────────────────
+/** The daemon's one model transport owner. */
+export class ModelRelay extends Context.Service<ModelRelay, { readonly send: Send }>()(
+  "rook/ModelRelay",
+) {
+  static readonly layer = Layer.effect(ModelRelay)(
+    Effect.gen(function* () {
+      const http = yield* HttpClient.HttpClient;
+      const processes = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fetchClient = Context.get(
+        yield* Layer.build(FetchHttpClient.layer),
+        HttpClient.HttpClient,
+      );
+      // A command's output is shared by every header that runs it, process-wide,
+      // and concurrent callers share one run. A failed run is not kept.
+      const outputs = yield* Cache.makeWith(
+        Effect.fnUntraced(function* (command: string) {
+          const output = yield* processes
+            .string(
+              ChildProcess.make("/bin/sh", ["-c", command], {
+                forceKillAfter: HEADER_COMMAND_KILL_GRACE,
+              }),
+            )
+            .pipe(Effect.timeout(HEADER_COMMAND_TIMEOUT));
+          const at = yield* Clock.currentTimeMillis;
+          return { value: output.trim(), at };
+        }),
+        {
+          capacity: Infinity,
+          timeToLive: (exit) => (Exit.isSuccess(exit) ? Duration.infinity : Duration.zero),
+        },
+      );
 
-type Call = {
-  method: string;
-  path: string;
-  headers: IncomingHttpHeaders;
-  body: string | undefined;
-  signal: AbortSignal;
-};
+      /** The command's output, run again when it is older than this source's
+       * ttl or is the `stale` output an upstream refused. */
+      const commandOutput = Effect.fnUntraced(function* (
+        source: Extract<HeaderSource, { command: string }>,
+        stale: Output | undefined,
+      ) {
+        const cached = yield* Cache.getSuccess(outputs, source.command);
+        if (Option.isSome(cached)) {
+          const current = cached.value;
+          const now = yield* Clock.currentTimeMillis;
+          if (current !== stale && (source.ttl === undefined || now - current.at < source.ttl)) {
+            return current;
+          }
+          // Only the first caller to see this output retires it; the others
+          // join the run it starts.
+          yield* Cache.invalidateWhen(outputs, source.command, (output) => output === current);
+        }
+        return yield* Cache.get(outputs, source.command);
+      });
 
-function answer(response: ServerResponse, status: number, message: string): void {
-  response.writeHead(status, { "content-type": "application/json" });
-  response.end(JSON.stringify({ error: { type: "rook_serve_error", message } }));
-}
-
-/** Runs `forward` for each call; a call it cannot make is answered with why. */
-function endpoint(forward: (call: Call, response: ServerResponse) => Promise<void>, log: Log) {
-  const serve: ModelEndpoint = async (request, response, path) => {
-    // A client that gives up on a call cancels it upstream too.
-    const disconnected = new AbortController();
-    response.on("close", () => disconnected.abort());
-    try {
-      const body =
-        request.method === "POST"
-          ? Buffer.concat(await Array.fromAsync(request)).toString()
-          : undefined;
-      const call = {
-        method: request.method ?? "GET",
-        path,
-        headers: request.headers,
-        body,
-        signal: disconnected.signal,
-      };
-      await forward(call, response);
-    } catch (error) {
-      if (disconnected.signal.aborted) return;
-      log(String(error));
-      // A stream that fails after its headers went out can only be cut off.
-      if (response.headersSent) {
-        response.destroy(error instanceof Error ? error : undefined);
-        return;
-      }
-      const refused = error instanceof SyntaxError || error instanceof z.ZodError;
-      answer(response, refused ? 400 : 502, error instanceof Error ? error.message : String(error));
-    }
-  };
-  return serve;
-}
-
-function forwardedHeaders(headers: IncomingHttpHeaders): Headers {
-  const forwarded = new Headers();
-  for (const name of FORWARDED_HEADERS) {
-    const value = headers[name];
-    if (value) forwarded.set(name, String(value));
-  }
-  return forwarded;
-}
-
-async function pipe(reply: Response, response: ServerResponse): Promise<void> {
-  const headers = new Headers(reply.headers);
-  // fetch decoded the body, which goes on with this server's own framing.
-  for (const name of ["content-encoding", "content-length", "transfer-encoding"]) {
-    headers.delete(name);
-  }
-  response.writeHead(reply.status, Object.fromEntries(headers));
-  if (reply.body) for await (const chunk of reply.body) response.write(chunk);
-  response.end();
-}
-
-// ── Headers ────────────────────────────────────────────────────────────────
-
-const run = promisify(execFile);
-// ponytail: one value per command for the whole process, rerun after its ttl or a 401.
-const commandOutputs = new Map<string, { value: string; at: number }>();
-
-async function commandOutput(
-  source: Extract<HeaderSource, { command: string }>,
-  refresh: boolean,
-): Promise<string> {
-  const cached = commandOutputs.get(source.command);
-  const fresh = cached && (source.ttl === undefined || Date.now() - cached.at < source.ttl);
-  if (cached && fresh && !refresh) return cached.value;
-  const { stdout } = await run("/bin/sh", ["-c", source.command], { timeout: 30_000 });
-  const value = stdout.trim();
-  commandOutputs.set(source.command, { value, at: Date.now() });
-  return value;
-}
-
-async function addHeaders(
-  headers: Headers,
-  sources: readonly HeaderSource[],
-  refresh: boolean,
-): Promise<void> {
-  for (const source of sources) {
-    if ("value" in source) {
-      headers.set(source.name, source.value);
-    } else if ("env" in source) {
-      const value = process.env[source.env];
-      if (value === undefined) {
-        if (source.optional) continue;
-        throw new Error(
-          `rook serve has no ${source.env} in its environment for the ${source.name} header: export it, stop rook serve, and run rook again`,
+      const header = Effect.fnUntraced(function* (
+        source: HeaderSource,
+        stale: ReadonlyMap<string, Output>,
+        used: Map<string, Output>,
+      ): Effect.fn.Return<readonly [string, string] | undefined, ModelTransportError> {
+        if ("value" in source) return [source.name, source.value] as const;
+        if ("command" in source) {
+          const output = yield* commandOutput(source, stale.get(source.command)).pipe(
+            Effect.mapError(transportError),
+          );
+          used.set(source.command, output);
+          return [source.name, `${source.prefix ?? ""}${output.value}`] as const;
+        }
+        const value = yield* Config.String(source.env).pipe(
+          Config.option,
+          Effect.mapError(transportError),
         );
-      }
-      headers.set(source.name, `${source.prefix ?? ""}${value}`);
-    } else {
-      headers.set(source.name, `${source.prefix ?? ""}${await commandOutput(source, refresh)}`);
-    }
-  }
+        if (Option.isSome(value))
+          return [source.name, `${source.prefix ?? ""}${value.value}`] as const;
+        if (source.optional) return undefined;
+        return yield* new ModelTransportError({
+          message: `rook serve has no ${source.env} in its environment for the ${source.name} header: export it, stop rook serve, and run rook again`,
+        });
+      });
+
+      /** An HttpClient over the upstream's transport: plain HTTP, the shared
+       * Responses WebSocket, and ChatGPT's OAuth for Codex. */
+      const client = Effect.fnUntraced(function* (upstream: Upstream) {
+        if (upstream.kind === "url" && upstream.transport === "http") return http;
+        const wrapper =
+          upstream.transport === "ws"
+            ? yield* Effect.acquireRelease(
+                Effect.sync(() => responsesOverWebSocket(connectNodeWebSocket)),
+                (transport) => Effect.tryPromise(() => transport.dispose()).pipe(Effect.ignore),
+              )
+            : undefined;
+        const socketFetch = wrapper?.(globalThis.fetch);
+        const fetch: typeof globalThis.fetch = socketFetch
+          ? (input, init) =>
+              socketFetch(
+                input,
+                init?.body instanceof Uint8Array
+                  ? { ...init, body: new TextDecoder().decode(init.body) }
+                  : init,
+              )
+          : globalThis.fetch;
+        const credentials = upstream.kind === "codex" ? openaiCredentials() : undefined;
+        const oauth = credentials
+          ? createOpenAIOAuthTransport({
+              auth: () => credentials.getSession(),
+              fetch,
+              responsesState: false,
+            })
+          : undefined;
+        const send: typeof globalThis.fetch = oauth
+          ? (input, init) => {
+              const url = new URL(String(input));
+              return oauth.request(`${url.pathname}${url.search}`, init);
+            }
+          : fetch;
+        // The SDK and shared Responses transport expose fetch. This is the
+        // actual foreign boundary; requests and bodies stay Effect-native.
+        return HttpClient.transform(fetchClient, (response) =>
+          response.pipe(Effect.provideService(FetchHttpClient.Fetch, send)),
+        );
+      });
+
+      // Keyed by the whole upstream: its transport, credentials and socket
+      // conversations belong to that configuration and no other.
+      const clients = yield* ScopedCache.make({
+        capacity: Infinity,
+        lookup: (key: string) =>
+          Effect.try(() => upstreamSchema.parse(JSON.parse(key))).pipe(Effect.flatMap(client)),
+      });
+
+      const send: Send = Effect.fnUntraced(function* (upstream, request) {
+        const upstreamClient = yield* ScopedCache.get(clients, JSON.stringify(upstream));
+        const owner = yield* Effect.scope;
+        const forwarded = Object.fromEntries(
+          FORWARDED_HEADERS.flatMap((name) =>
+            request.headers[name] === undefined ? [] : [[name, request.headers[name]]],
+          ),
+        );
+        const prepared = request.pipe(
+          HttpClientRequest.updateHeaders(() => Headers.fromInput(forwarded)),
+          HttpClientRequest.prependUrl(
+            upstream.kind === "codex" ? "https://chatgpt.com/v1" : upstream.baseUrl,
+          ),
+          (outgoing) =>
+            HttpClientRequest.setUrl(outgoing, new URL(outgoing.url)).pipe(
+              HttpClientRequest.appendUrlParams(outgoing.urlParams),
+            ),
+          HttpClientRequest.setUrlParams(upstream.kind === "url" ? upstream.query : {}),
+        );
+        // Each attempt owns a child scope, so a refused response can be
+        // released before the retry while the accepted one lives with the caller.
+        const attempt = Effect.fnUntraced(function* (stale: ReadonlyMap<string, Output>) {
+          const used = new Map<string, Output>();
+          const headers = yield* Effect.forEach(
+            upstream.kind === "url" ? upstream.headers : [],
+            (source) => header(source, stale, used),
+          );
+          const outgoing = HttpClientRequest.setHeaders(
+            prepared,
+            Object.fromEntries(headers.filter((entry) => entry !== undefined)),
+          );
+          const scope = yield* Scope.fork(owner);
+          const response = yield* HttpClient.withScope(upstreamClient)
+            .execute(outgoing)
+            .pipe(Scope.provide(scope));
+          return { response, scope, used };
+        });
+        const first = yield* attempt(new Map());
+        if (
+          first.response.status !== 401 ||
+          upstream.kind !== "url" ||
+          !upstream.headers.some((source) => "command" in source)
+        ) {
+          return first.response;
+        }
+        yield* Scope.close(first.scope, Exit.void);
+        return (yield* attempt(first.used)).response;
+      }, Effect.mapError(transportError));
+      return { send };
+    }),
+  );
 }
 
-// ── Responses and chat ─────────────────────────────────────────────────────
+/** A model call serve answers itself, shaped like an upstream's error. */
+export const modelError = (status: number, message: string) =>
+  HttpServerResponse.jsonUnsafe({ error: { type: "rook_serve_error", message } }, { status });
 
-function codexEndpoint(transport: "ws" | "http", log: Log): ModelEndpoint {
-  const credentials = openaiCredentials();
-  const oauth = createOpenAIOAuthTransport({
-    auth: () => credentials.getSession(),
-    fetch: transport === "ws" ? responsesOverWebSocket(connectNodeWebSocket, log)(fetch) : fetch,
-    responsesState: false,
-  });
-  return endpoint(async (call, response) => {
-    const reply = await oauth.request(`/v1${call.path}`, {
-      method: call.method,
-      headers: forwardedHeaders(call.headers),
-      body: call.body,
-      signal: call.signal,
+/** Framing headers that describe the upstream's body, not the stream served from it. */
+const HOP_HEADERS = ["content-encoding", "content-length", "transfer-encoding"];
+
+/** Sends `call` (its path is what follows the upstream's /v1) and streams the
+ * answer back. A transport failure is the upstream's, 502. */
+export const relayModelCall = Effect.fnUntraced(
+  function* (call: HttpClientRequest.HttpClientRequest, upstream: Upstream) {
+    const relay = yield* ModelRelay;
+    const reply = yield* relay.send(upstream, call);
+    return HttpServerResponse.stream(reply.stream, {
+      status: reply.status,
+      headers: Headers.removeMany(reply.headers, HOP_HEADERS),
     });
-    await pipe(reply, response);
-  }, log);
-}
+  },
+  Effect.catch((error) => Effect.succeed(modelError(502, error.message))),
+);
 
-function urlEndpoint(upstream: UrlUpstream, log: Log): ModelEndpoint {
-  const send =
-    upstream.transport === "ws" ? responsesOverWebSocket(connectNodeWebSocket, log)(fetch) : fetch;
-  // A header from a command is fetched again after a 401.
-  const refreshes = upstream.headers.some((source) => "command" in source);
-  return endpoint(async (call, response) => {
-    const url = new URL(`${upstream.baseUrl.replace(/\/$/, "")}${call.path}`);
-    for (const [name, value] of Object.entries(upstream.query)) url.searchParams.set(name, value);
-    const attempt = async (refresh: boolean) => {
-      const headers = forwardedHeaders(call.headers);
-      await addHeaders(headers, upstream.headers, refresh);
-      return send(url, { method: call.method, headers, body: call.body, signal: call.signal });
-    };
-    let reply = await attempt(false);
-    if (reply.status === 401 && refreshes) {
-      await reply.body?.cancel();
-      reply = await attempt(true);
-    }
-    await pipe(reply, response);
-  }, log);
-}
-
-// ── serve ──────────────────────────────────────────────────────────────────
-
-/** Calls to one upstream; `path` is below its /v1, such as /responses. */
-export function upstreamEndpoint(upstream: Upstream, log: Log): ModelEndpoint {
-  if (upstream.kind === "codex") return codexEndpoint(upstream.transport, log);
-  return urlEndpoint(upstream, log);
-}
-
-function readUpstream(home: string, name: string): Upstream | undefined {
-  const { upstreams } = readConfig(home);
-  return Object.hasOwn(upstreams, name) ? upstreams[name] : undefined;
-}
-
-/** serve's model calls: /<upstream>/v1/..., to the upstream of that name in ROOK_HOME's model.json. */
-export function modelRelay(
-  home: string,
-  log: Log = (line) => console.log(`[model] ${line}`),
-): ModelEndpoint {
-  // An upstream keeps its endpoint, and so its sockets, until its settings change.
-  // ponytail: a replaced upstream's endpoint stays until serve exits.
-  const endpoints = new Map<string, ModelEndpoint>();
-  return async (request, response, path) => {
-    const { pathname, search } = new URL(path, "http://127.0.0.1");
-    const [, name = "", version, ...rest] = pathname.split("/");
-    let upstream: Upstream | undefined;
-    try {
-      upstream = version === "v1" ? readUpstream(home, name) : undefined;
-    } catch (error) {
-      answer(response, 500, `${join(home, MODEL_FILE)}: ${String(error)}`);
-      return;
-    }
-    if (!upstream) {
-      answer(response, 404, `rook serve has no model upstream at /${name}/v1: run rook model`);
-      return;
-    }
-    const key = JSON.stringify(upstream);
-    let forward = endpoints.get(key);
-    if (!forward) {
-      forward = upstreamEndpoint(upstream, log);
-      endpoints.set(key, forward);
-    }
-    await forward(request, response, `/${rest.join("/")}${search}`);
-  };
-}
+/** Forwards one server request to `upstream` at `path`. A method HTTP does not
+ * define is refused with 405, as the request's fault. */
+export const forwardModelCall = Effect.fnUntraced(
+  function* (request: HttpServerRequest.HttpServerRequest, upstream: Upstream, path: string) {
+    const method = request.method;
+    if (!HttpMethod.isHttpMethod(method)) return modelError(405, `unsupported method ${method}`);
+    const outgoing = HttpClientRequest.make(method)(path, { headers: request.headers });
+    const call =
+      method === "POST"
+        ? HttpClientRequest.bodyText(
+            outgoing,
+            yield* request.text,
+            request.headers["content-type"] ?? "application/json",
+          )
+        : outgoing;
+    return yield* relayModelCall(call, upstream);
+  },
+  Effect.catch((error) => Effect.succeed(modelError(502, error.message))),
+);

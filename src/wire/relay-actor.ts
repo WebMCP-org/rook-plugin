@@ -80,16 +80,24 @@ export class RelayActor<Socket extends RelaySocket, Accepted> {
   // the actor in memory; nothing here must survive hibernation. The pending
   // pairing IS the awaiting request.
   private pendingTunnels = new Map<string, (tunnel: Socket | null) => void>();
+  private disposed = false;
 
   constructor(
     private readonly host: RelaySocketHost<Socket>,
     private readonly tunnelConnectTimeoutMs: number,
   ) {}
 
+  /** Ends an ephemeral host lifetime; its owner closes the physical sockets. */
+  dispose(): void {
+    this.disposed = true;
+    for (const settle of this.pendingTunnels.values()) settle(null);
+  }
+
   async upgrade(
     upgrade: RelayUpgrade,
     accept: AcceptSocket<Socket, Accepted>,
   ): Promise<Response | Accepted> {
+    if (this.disposed) return new Response("relay closed", { status: 503 });
     switch (upgrade.role) {
       case "control":
         return this.acceptControl(accept);
@@ -175,7 +183,10 @@ export class RelayActor<Socket extends RelaySocket, Accepted> {
   // The web upgrade completes only after its tunnel is paired, so the web
   // client's open event cannot race the extension's dial — no frame is ever
   // sent to a peerless socket, and nothing needs buffering.
-  private async acceptWeb(url: string, accept: AcceptSocket<Socket, Accepted>): Promise<Accepted> {
+  private async acceptWeb(
+    url: string,
+    accept: AcceptSocket<Socket, Accepted>,
+  ): Promise<Response | Accepted> {
     const control = this.controlSocket();
     if (!control) return this.closeAsOffline(accept);
 
@@ -191,6 +202,9 @@ export class RelayActor<Socket extends RelaySocket, Accepted> {
       };
       this.pendingTunnels.set(tunnelId, settle);
     });
+    // Disposal resolves the pending wait only to clear its timer and release
+    // the operation; it must never accept a stale upgrade after host teardown.
+    if (this.disposed) return new Response("relay closed", { status: 503 });
     if (!tunnel) return this.closeAsOffline(accept);
 
     const { accepted } = accept([WEB_TAG, pairTag(tunnelId)], { role: "web", tunnelId, url });

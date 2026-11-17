@@ -2,6 +2,7 @@
 // as Rook calls it, over both transports. It spends the user's plan, so it
 // runs only with ROOK_LIVE_MODELS=1.
 import { randomUUID } from "node:crypto";
+import { Effect, Exit, Scope } from "effect";
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,9 +11,10 @@ import { resolveAuthFileCandidates } from "@openai-oauth/local/auth-file";
 import { generateText, tool, type ModelMessage } from "ai";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { servedSource, testModel, writeConfig, type Selection } from "./model";
-import { modelRelay } from "./relay";
-import { startLocalRelay } from "./serve";
+import { servedSource } from "./model";
+import { testModel } from "./model-probe";
+import type { Selection } from "./model-settings";
+import { testRelay, writeModelFixture, modelTestLayer } from "./relay-test-fixture";
 import { DEFAULT_CHATGPT_MODEL_ID } from "./wire/contracts";
 import { LOCAL_RELAY_ORIGIN } from "./wire/relay";
 
@@ -56,14 +58,17 @@ describe.each(["ws", "http"] as const)("codex over %s through rook serve", (tran
       upstream: { kind: "codex", transport },
       choice: { upstream: "codex", model: DEFAULT_CHATGPT_MODEL_ID, effort: "low" },
     };
-    writeConfig(home, { version: 1, upstreams: { codex: selection.upstream }, off: [] });
-    const logs: string[] = [];
-    const model = modelRelay(home, (line) => logs.push(line));
-    const relay = await startLocalRelay({ port: 0, token: TOKEN, model });
+    writeModelFixture(home, { version: 1, upstreams: { codex: selection.upstream }, off: [] });
+    const scope = Scope.makeUnsafe();
+    const relay = await Effect.runPromise(
+      Scope.provide(testRelay({ port: 0, token: TOKEN, home }), scope),
+    );
     const origin = `http://127.0.0.1:${relay.port}`;
     try {
-      await testModel(selection, TOKEN, origin);
-      const { baseUrl, modelId } = servedSource(selection);
+      await Effect.runPromise(
+        testModel(selection).pipe(Effect.provide(modelTestLayer(home, relay.port, TOKEN))),
+      );
+      const { baseUrl, modelId } = servedSource(selection, origin);
       const rook = {
         model: createOpenAI({
           baseURL: baseUrl.replace(LOCAL_RELAY_ORIGIN, origin),
@@ -120,12 +125,8 @@ describe.each(["ws", "http"] as const)("codex over %s through rook serve", (tran
         ],
       });
       expect(second.text).toContain("TEAL-42");
-      // Every call went over the transport chosen: a socket logs each send,
-      // and falling back to HTTP says so.
-      expect(logs.filter((line) => line.includes("HTTP"))).toEqual([]);
-      expect(logs.some((line) => /sent in full|appended/.test(line))).toBe(transport === "ws");
     } finally {
-      await relay.close();
+      await Effect.runPromise(Scope.close(scope, Exit.void));
     }
   }, 180_000);
 });

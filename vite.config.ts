@@ -19,8 +19,12 @@ export default defineConfig({
     outExtensions: () => ({ js: "" }),
     format: ["esm"],
     platform: "node",
-    target: "node22.18",
+    target: "node22.19",
     clean: true,
     deps: { onlyBundle: false },
+  },
+  // Process tests spawn the packed binary; it is built once per run here.
+  test: {
+    globalSetup: ["src/testing/global-setup.ts"],
   },
 });

@@ -5,7 +5,10 @@ import marketplace from "../.claude-plugin/marketplace.json" with { type: "json"
 import plugin from "../.claude-plugin/plugin.json" with { type: "json" };
 import codexPlugin from "../plugin.json" with { type: "json" };
 import packageJson from "../package.json" with { type: "json" };
-import { EXIT, reply, toolInput, toolReply } from "./main";
+import { Effect } from "effect";
+import { toolInput, toolReply } from "./cli";
+import { reply } from "./conversation";
+import { EXIT } from "./command";
 
 it("answers with what the side panel shows of the last reply: its text and files", () => {
   const messages: UIMessage[] = [
@@ -37,16 +40,20 @@ it("answers with what the side panel shows of the last reply: its text and files
   expect(reply(messages.slice(0, 3))).toEqual({ text: "", files: [] });
 });
 
-it("lists every exit code in the skill's table", () => {
-  const skill = readFileSync(new URL("../skills/rook-browser/SKILL.md", import.meta.url), "utf8");
-  const table = [...skill.matchAll(/^\| (\d+) +\|/gmu)].map(([, code]) => Number(code));
+it("lists every exit code in the guide's table", () => {
+  const guide = readFileSync(new URL("../guide.md", import.meta.url), "utf8");
+  const table = [...guide.matchAll(/^\| (\d+) +\|/gmu)].map(([, code]) => Number(code));
   expect(table.toSorted((a, b) => a - b)).toEqual(Object.values(EXIT).toSorted((a, b) => a - b));
 });
 
-it("names this version wherever an agent installs it from", () => {
+it("installs a skill that names no version, so no copy of it goes stale", () => {
   const skill = readFileSync(new URL("../skills/rook-browser/SKILL.md", import.meta.url), "utf8");
-  expect(skill).toContain(`\`rook ${packageJson.version} (${packageJson.name})\``);
-  expect(skill).toContain(`\`npx -y ${packageJson.name}@${packageJson.version}\``);
+  expect(skill).toContain("`rook guide`");
+  expect(skill).toContain(`\`npx -y ${packageJson.name} guide\``);
+  expect(skill).not.toMatch(/\d+\.\d+/u);
+});
+
+it("names this version wherever an agent installs it from", () => {
   expect(plugin.version).toBe(packageJson.version);
   expect(codexPlugin.version).toBe(packageJson.version);
   expect(marketplace.plugins[0]?.source).toEqual({
@@ -80,8 +87,8 @@ it("prints a tool result's text and turns its images and resources into files", 
       { type: "file", mediaType: "application/octet-stream", url: "https://example.com/a.pdf" },
     ],
   });
-  expect(toolInput(undefined)).toEqual({});
+  expect(Effect.runSync(toolInput(undefined))).toEqual({});
   for (const args of ["[1]", "{query: shoes}", "3"]) {
-    expect(() => toolInput(args)).toThrow(expect.objectContaining({ code: 2 }));
+    expect(Effect.runSync(Effect.flip(toolInput(args)))).toMatchObject({ code: EXIT.usage });
   }
 });

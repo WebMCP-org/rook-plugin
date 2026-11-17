@@ -32,6 +32,7 @@ it("releases completed response listeners even when Node collects signal cleanup
   const { port } = z.object({ port: z.number() }).parse(server.address());
   const origin = `http://127.0.0.1:${port}`;
   const adapter = new URL("./wire/responses-socket.ts", import.meta.url).href;
+  const connector = new URL("./node-responses-socket.ts", import.meta.url).href;
   try {
     // A separate real Node process both exposes GC and makes an uncaught
     // WebSocket callback crash fail the test instead of killing its runner.
@@ -43,7 +44,8 @@ it("releases completed response listeners even when Node collects signal cleanup
         "-e",
         `
         import { setImmediate } from "node:timers/promises";
-        import { connectNodeWebSocket, responsesOverWebSocket } from ${JSON.stringify(adapter)};
+        import { responsesOverWebSocket } from ${JSON.stringify(adapter)};
+        import { connectNodeWebSocket } from ${JSON.stringify(connector)};
         const sockets = [];
         const request = responsesOverWebSocket(async (...args) => {
           const socket = await connectNodeWebSocket(...args);

@@ -1,25 +1,20 @@
 import { z } from "zod";
 
-/**
- * Opens a WebSocket whose upgrade request carries `headers`, or resolves
- * undefined when the handshake fails. Node's WebSocket takes headers in its
- * init; a browser needs the extension to add them on the network.
- */
-export type ConnectWebSocket = (url: string, headers: Headers) => Promise<WebSocket | undefined>;
-
-/** The relay's and tests' connector: Node's WebSocket (undici) takes handshake headers in its init. */
-export const connectNodeWebSocket: ConnectWebSocket = async (url, headers) => {
-  // The DOM declaration this package compiles against has no such overload.
-  const socket: WebSocket = Reflect.construct(WebSocket, [
-    url,
-    { headers: Object.fromEntries(headers) },
-  ]);
-  const opened = await new Promise<boolean>((resolve) => {
-    socket.addEventListener("open", () => resolve(true), { once: true });
-    socket.addEventListener("error", () => resolve(false), { once: true });
-  });
-  return opened ? socket : undefined;
+/** The native browser socket surface used by the Responses transport. */
+export type ResponsesSocket = Pick<
+  WebSocket,
+  "readyState" | "send" | "close" | "addEventListener" | "removeEventListener"
+> & {
+  /** Node can release a socket without waiting for the peer's close handshake. */
+  terminate?: () => void;
 };
+
+/** Opens a socket with handshake headers; cancellation covers the handshake. */
+export type ConnectWebSocket = (
+  url: string,
+  headers: Headers,
+  signal?: AbortSignal,
+) => Promise<ResponsesSocket | undefined>;
 
 // openai/codex codex-rs/core/src/client.rs RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE.
 const WEBSOCKET_BETA = "responses_websockets=2026-02-06";
@@ -56,7 +51,7 @@ type Item = z.infer<typeof itemsSchema>[number];
 // What ChatGPT holds for this socket: the last request and the items it returned.
 type Previous = { request: RequestBody; output: Item[]; responseId: string };
 type Conversation = {
-  socket: Promise<WebSocket | undefined>;
+  socket: Promise<ResponsesSocket | undefined>;
   // The ChatGPT account the socket authenticated as; another one needs its own
   // socket. A refreshed token keeps it: the socket is already authenticated.
   account: string | null;
@@ -75,20 +70,25 @@ type Conversation = {
  * hits ChatGPT's connection limit before answering, and a conversation's
  * requests for a few minutes after a refused handshake. The returned wrapper keeps the sockets,
  * so a caller holds one per process and wraps each model's fetch with it.
+ * Its dispose() ends that lifetime, including pending Node handshakes.
  */
 export function responsesOverWebSocket(
   connect: ConnectWebSocket,
   log: (line: string) => void = () => {},
-): (fetch: typeof globalThis.fetch) => typeof globalThis.fetch {
+) {
+  const lifetime = new AbortController();
   const conversations = new Map<string, Conversation>();
   const refusedUntil = new Map<string, number>();
+  // A dropped/replaced conversation may still be closing its real socket.
+  // Resource ownership lasts through close, independently of cache membership.
+  const connections = new Set<Promise<ResponsesSocket | undefined>>();
 
   function forget(sessionId: string, conversation: Conversation) {
     if (conversations.get(sessionId) === conversation) conversations.delete(sessionId);
   }
 
   // Check-and-set with no await between, so concurrent first requests share one handshake.
-  function open(sessionId: string, url: string, headers: Headers) {
+  function open(sessionId: string, url: string, headers: Headers, signal: AbortSignal) {
     const account = headers.get("chatgpt-account-id");
     const current = conversations.get(sessionId);
     if (current && (current.account === account || current.busy)) return current;
@@ -100,15 +100,27 @@ export function responsesOverWebSocket(
     handshake.delete("content-type");
     handshake.set("openai-beta", WEBSOCKET_BETA);
     const conversation: Conversation = { socket: Promise.resolve(undefined), account, busy: false };
-    conversation.socket = connect(url.replace(/^http/u, "ws"), handshake).then(
+    conversation.socket = connect(url.replace(/^http/u, "ws"), handshake, signal).then(
       (socket) => {
-        if (!socket) return refused(sessionId, conversation, "ChatGPT refused the WebSocket");
+        if (!socket) {
+          if (signal.aborted) {
+            forget(sessionId, conversation);
+            return undefined;
+          }
+          return refused(sessionId, conversation, "ChatGPT refused the WebSocket");
+        }
         socket.addEventListener("close", () => forget(sessionId, conversation));
         return socket;
       },
       (error: Error) =>
         refused(sessionId, conversation, `WebSocket connect failed: ${error.message}`),
     );
+    const pending = conversation.socket;
+    connections.add(pending);
+    void pending.then((socket) => {
+      if (!socket || socket.readyState === WebSocket.CLOSED) connections.delete(pending);
+      else socket.addEventListener("close", () => connections.delete(pending), { once: true });
+    });
     conversations.set(sessionId, conversation);
     return conversation;
   }
@@ -120,42 +132,72 @@ export function responsesOverWebSocket(
     return undefined;
   }
 
-  return (fetch) => async (input, init) => {
-    const url = String(input);
-    const headers = new Headers(init?.headers);
-    const sessionId = headers.get("session-id");
-    // A query (Azure's api-version) rides along to the socket's URL.
-    if (!sessionId || !URL.parse(url)?.pathname.endsWith("/responses") || init?.signal?.aborted) {
-      return fetch(input, init);
-    }
-    if ((refusedUntil.get(sessionId) ?? 0) > Date.now()) return fetch(input, init);
-    const parsed = parseJson(requestBodySchema, String(init?.body));
-    // Only a streamed request has a socket equivalent.
-    if (parsed?.stream !== true) return fetch(input, init);
-    // Transport fields of the HTTP request; a socket message carries neither.
-    const { stream: _stream, background: _background, ...body } = parsed;
-    let conversation = open(sessionId, url, headers);
-    let socket = await conversation.socket;
-    // A socket whose Agent context ended reads CLOSED without a close event,
-    // and a response it was serving never settles, so its conversation can
-    // still read busy. Every other failure clears busy before it drops.
-    if (socket && socket.readyState >= WebSocket.CLOSING) {
-      forget(sessionId, conversation);
-      conversation = open(sessionId, url, headers);
-      socket = await conversation.socket;
-    }
-    // ponytail: one response per socket; a concurrent request (a compaction
-    // summary) goes over HTTP rather than a second lane.
-    if (socket?.readyState !== WebSocket.OPEN || conversation.busy) return fetch(input, init);
-    // A socket that fails is forgotten at once, so the next request opens another.
-    const drop = () => {
-      forget(sessionId, conversation);
-      socket.close();
+  const wrap =
+    (fetch: typeof globalThis.fetch): typeof globalThis.fetch =>
+    async (input, init) => {
+      lifetime.signal.throwIfAborted();
+      const signal = init?.signal
+        ? AbortSignal.any([lifetime.signal, init.signal])
+        : lifetime.signal;
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      const sessionId = headers.get("session-id");
+      // A query (Azure's api-version) rides along to the socket's URL.
+      if (!sessionId || !URL.parse(url)?.pathname.endsWith("/responses") || init?.signal?.aborted) {
+        return fetch(input, init);
+      }
+      if ((refusedUntil.get(sessionId) ?? 0) > Date.now()) return fetch(input, init);
+      const parsed = parseJson(requestBodySchema, String(init?.body));
+      // Only a streamed request has a socket equivalent.
+      if (parsed?.stream !== true) return fetch(input, init);
+      // Transport fields of the HTTP request; a socket message carries neither.
+      const { stream: _stream, background: _background, ...body } = parsed;
+      let conversation = open(sessionId, url, headers, signal);
+      let socket = await conversation.socket;
+      signal.throwIfAborted();
+      // A socket whose Agent context ended reads CLOSED without a close event,
+      // and a response it was serving never settles, so its conversation can
+      // still read busy. Every other failure clears busy before it drops.
+      if (socket && socket.readyState >= WebSocket.CLOSING) {
+        forget(sessionId, conversation);
+        conversation = open(sessionId, url, headers, signal);
+        socket = await conversation.socket;
+        signal.throwIfAborted();
+      }
+      // ponytail: one response per socket; a concurrent request (a compaction
+      // summary) goes over HTTP rather than a second lane.
+      if (socket?.readyState !== WebSocket.OPEN || conversation.busy) return fetch(input, init);
+      // A socket that fails is forgotten at once, so the next request opens another.
+      const drop = () => {
+        forget(sessionId, conversation);
+        socket.close();
+      };
+      const label = sessionId.slice(0, 8);
+      const response = await respond(conversation, socket, drop, label, body, signal, log);
+      signal.throwIfAborted();
+      return response ?? fetch(input, init);
     };
-    const label = sessionId.slice(0, 8);
-    const response = await respond(conversation, socket, drop, label, body, init?.signal, log);
-    return response ?? fetch(input, init);
-  };
+  return Object.assign(wrap, {
+    async dispose(): Promise<void> {
+      // Snapshot before abort: closing a live response removes its conversation.
+      const sockets = [...connections];
+      lifetime.abort();
+      await Promise.all(
+        sockets.map(async (pending) => {
+          const socket = await pending;
+          if (!socket || socket.readyState === WebSocket.CLOSED) return;
+          await new Promise<void>((resolve) => {
+            socket.addEventListener("close", () => resolve(), { once: true });
+            if (socket.terminate) socket.terminate();
+            else socket.close();
+          });
+        }),
+      );
+      conversations.clear();
+      connections.clear();
+      refusedUntil.clear();
+    },
+  });
 }
 
 /**
@@ -167,7 +209,7 @@ export function responsesOverWebSocket(
  */
 function respond(
   conversation: Conversation,
-  socket: WebSocket,
+  socket: ResponsesSocket,
   drop: () => void,
   label: string,
   body: RequestBody,
