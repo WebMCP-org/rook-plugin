@@ -126,7 +126,8 @@ it("rename against a Rook that predates renameThread exits 5 asking for an updat
 });
 
 it("rm ends another process's wait on that thread as stopped", async () => {
-  const peer = await fakePeer({ outcome: "running" });
+  // Keep the status RPC in flight when the deleting process closes the socket.
+  const peer = await fakePeer({ outcome: "held" });
   try {
     const waiting = peer.start("wait", THREAD, "--timeout", "0");
     await expect.poll(() => peer.calls.map(({ call }) => call.method)).toContain("turnOutcome");
@@ -139,6 +140,24 @@ it("rm ends another process's wait on that thread as stopped", async () => {
       stdout: "",
       stderr: expect.stringContaining("stopped: the thread was deleted\n"),
     });
+  } finally {
+    await peer.close();
+  }
+});
+
+it("wait reports a connection error when the closed thread remains in the roster", async () => {
+  const peer = await fakePeer({ outcome: "held" });
+  try {
+    const waiting = peer.start("wait", THREAD, "--timeout", "0");
+    await expect.poll(() => peer.calls.map(({ call }) => call.method)).toContain("turnOutcome");
+    const statusRead = peer.calls.find(({ call }) => call.method === "turnOutcome");
+    if (!statusRead) throw new Error("The waiter did not ask for the turn outcome");
+    statusRead.socket.close();
+    expect(await waiting.result).toMatchObject({
+      code: 1,
+      stderr: "rook: Connection closed\n",
+    });
+    expect(peer.state.threads.map(({ id }) => id)).toEqual([THREAD]);
   } finally {
     await peer.close();
   }

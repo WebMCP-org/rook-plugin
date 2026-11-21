@@ -9,6 +9,7 @@ import {
   type UIMessageChunk,
 } from "ai";
 import { Deferred, Effect, Fiber, Queue, Ref, Schedule, Stream } from "effect";
+import { AgentConnectionClosedError } from "agents/client";
 import { CommandError, EXIT } from "./command";
 import { CliSession, type Status } from "./output";
 import {
@@ -31,6 +32,8 @@ const STATUS_EXIT = {
 const OUTCOME = { completed: "completed", error: "failed", aborted: "stopped" } as const;
 /** How often a follower re-reads the synchronized thread roster. */
 const ROSTER_POLL_MS = 200;
+/** Allow the root roster to catch up when a pending read loses its child socket. */
+const DELETION_CONFIRM_MS = 2_000;
 /** How long a failed turn's replayed error has to arrive before the fallback detail. */
 const EXPLAIN_MS = 3_000;
 /** How much of a failed tool call's error `show --tools` prints. */
@@ -303,6 +306,7 @@ export const follow = Effect.fn("rook.follow")(function* (
   const observer = yield* observeConversation(profile, threadId, options);
   const sawRunning = yield* Ref.make(false);
   const sawThread = yield* Ref.make(false);
+  const deleted: Settled = { status: "stopped", detail: "the thread was deleted" };
   // The CLI ships on npm and Rook on the Web Store, days apart: a follow-up to
   // a Rook without inspectSubmission follows the thread, as rook wait does.
   const byThread = yield* Ref.make(options.submitted === undefined);
@@ -333,10 +337,7 @@ export const follow = Effect.fn("rook.follow")(function* (
     const thread = state.threads.find(({ id }) => id === threadId);
     const listed = yield* Ref.getAndUpdate(sawThread, (value) => value || thread !== undefined);
     // A thread that was listed and is gone was deleted, by rook rm or in the side panel.
-    if (!thread && listed) {
-      const settled: Settled = { status: "stopped", detail: "the thread was deleted" };
-      return settled;
-    }
+    if (!thread && listed) return deleted;
     const submitted = (yield* Ref.get(byThread)) ? undefined : options.submitted;
     const record = submitted === undefined ? undefined : yield* observer.submission(submitted);
     if (submitted !== undefined && record === undefined) yield* Ref.set(byThread, true);
@@ -382,6 +383,30 @@ export const follow = Effect.fn("rook.follow")(function* (
         schedule: Schedule.spaced(ROSTER_POLL_MS),
         until: (result) => result !== undefined,
       }),
+      Effect.catchIf(
+        (error) =>
+          error instanceof CommandError && error.cause instanceof AgentConnectionClosedError,
+        (error) =>
+          Effect.gen(function* () {
+            if (!(yield* Ref.get(sawThread))) return yield* Effect.fail(error);
+            const { root } = profile;
+            // The host tears down a deleted thread before it publishes the root
+            // roster. Confirm deletion on the live root of this same profile.
+            yield* Effect.sync(
+              () =>
+                root.identified &&
+                root.readyState === root.OPEN &&
+                root.state?.threads.every(({ id }) => id !== threadId) === true,
+            ).pipe(
+              Effect.repeat({ schedule: Schedule.spaced(ROSTER_POLL_MS), until: Boolean }),
+              Effect.timeoutOrElse({
+                duration: DELETION_CONFIRM_MS,
+                orElse: () => Effect.fail(error),
+              }),
+            );
+            return deleted;
+          }),
+      ),
     );
     if (settled === undefined) return yield* Effect.die("the roster poll ended unsettled");
     let { status, detail }: Settled = settled;

@@ -117,7 +117,14 @@ export type RookDirectoryState = {
 
 export type RookDirectory = {
   /** Mints the conversation the caller named around its first message. */
-  startThread(id: string, input: { text: string; files: FileUIPart[] }): Promise<void>;
+  startThread(
+    id: string,
+    input: {
+      text: string;
+      files?: FileUIPart[];
+      origin?: "user" | "setup";
+    },
+  ): Promise<void>;
   /** False when `messageId` was already submitted. */
   submitMessage(threadId: string, messageId: string, text: string): Promise<boolean>;
   runAutomation(
